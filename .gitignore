@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+
+# Data — never commit raw dataset
+NEU-CLS/
+*.bmp
+*.jpg
+*.jpeg
+*.png
+!assets/*.png   # allow README assets
+
+# Model weights — too large for git; use Git LFS or HF Hub
+*.pth
+*.pt
+*.onnx
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Outputs
+*.pdf
+score_distribution.png
+confusion_matrix.png
+roc_curve.png
+gradcam_per_class.png
+error_analysis.png
+error_confusion.png
+training_curves.png
+lr_schedule.png
+augmentation_grid.png
+*_prediction.png
+
+# System
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
