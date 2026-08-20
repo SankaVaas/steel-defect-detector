@@ -93,10 +93,98 @@ with custom heads/dropout) are caught immediately instead of at deployment.
 
 ---
 
+## System architecture
+
+![Production steel defect detection cascade](docs/architecture.png)
+
+A single closed-set classifier on a pre-cropped image — the kind of model
+trained by `train.py` in this repo — is one stage of a larger system, not
+the whole solution to the manufacturing problem. It assumes the defect has
+already been found, is already centered in frame, is already one of a fixed
+set of known types, and that a raw softmax probability is trustworthy
+enough to act on. None of those assumptions survive contact with a real
+production line, where defects appear at arbitrary locations on a moving
+strip, multiple defects can co-occur in one frame, genuinely new defect
+types show up that no one has labeled yet, and a false negative can mean a
+defective coil shipping to a customer. The diagram above shows the full
+pipeline this project is designed to fit into, end to end.
+
+**Data pool.** Every frame the plant's line-scan cameras capture is
+retained, labeled or not. Unlabeled images are nearly free to collect since
+the cameras are already running; labeled images require a metallurgist's
+time and are the scarce resource the rest of the architecture is designed
+to conserve.
+
+**Foundation backbone.** Rather than starting from ImageNet weights, the
+backbone is pretrained with a self-supervised objective — masked-image
+modeling (MAE) or self-distillation (DINO-style) — directly on the plant's
+own unlabeled footage. ImageNet weights encode what natural photographs of
+everyday objects look like; a backbone pretrained this way encodes what
+*this plant's steel texture statistics* look like, using the abundant
+unlabeled pool instead of expensive labels. Every stage downstream —
+anomaly detection, defect classification, novel-defect clustering — reuses
+this same embedding space.
+
+**Real-time anomaly triage.** A lightweight one-class model (a memory-bank
+approach like PatchCore, or a small autoencoder/normalizing-flow density
+head) trained almost entirely on normal surface — cheap to collect, since
+it needs no defect labels at all — runs on every single frame at full line
+speed, quantized to INT8 and compiled for millisecond-level latency. This
+is the stage that keeps the system honest about defects it has never seen:
+an anomaly detector doesn't need a label for a failure mode to flag it as
+"not normal," so a new steel grade, a new failure mode, or a degrading
+roller gets caught here even when nothing downstream has a class for it.
+It also solves the compute-budget problem — only the regions this stage
+flags get passed to the expensive stages that follow.
+
+**Detection and localization.** A detector fine-tuned from the same
+foundation backbone runs only on flagged regions and outputs bounding boxes
+with a multi-task head: defect type and a size/depth estimate together,
+because real accept/reject decisions under steel grading standards (ASTM,
+EN) depend on how large and how deep a defect is, not merely that one is
+present.
+
+**Classify + calibrate.** This is the stage the classifier in this
+repository (`train.py`, `src/model.py`) is built for — but production use
+requires two things a benchmark classifier skips. First, calibration
+(temperature scaling on a held-out set), because raw softmax confidence is
+routinely overconfident and an automated decision built on an uncalibrated
+number is built on sand. Second, uncertainty quantification: a small deep
+ensemble — the five checkpoints already produced by this repo's 5-fold
+cross-validation are, for free, five independently seeded models suitable
+for exactly this — or MC-Dropout, measuring how much the model's
+predictions disagree with themselves. Predictions where the ensemble
+disagrees are treated as uncertain regardless of how confident any single
+model is.
+
+**Confidence-gated decision.** Confident predictions go straight to the
+line control system for automated accept/reject. Uncertain ones — low
+confidence, high ensemble disagreement, or anomaly-flagged but
+unclassifiable — are routed to a human review queue instead of forcing the
+model to guess. This is the single design choice that makes the system
+trustworthy enough to deploy: it does not need to be right every time, it
+only needs to know when it doesn't know.
+
+**Drift monitor and retrain trigger.** Both paths feed an MLOps layer that
+tracks embedding-distribution shift against the training distribution
+(population stability index or MMD), versions every dataset and model
+(e.g. DVC plus a model registry), and promotes retrained models through
+shadow deployment and canary rollout rather than swapping models in blind.
+Human-reviewed cases — especially ones that came from an anomaly flag with
+no good classifier match — feed back into the data pool as new labeled
+examples, closing the loop and giving the taxonomy itself a way to grow as
+new defect types are discovered, rather than staying fixed at whatever six
+classes NEU-CLS happened to define.
+
+---
+
 ## Project structure
 
 ```
 steel-defect-detector/
+├── docs/
+│   ├── architecture.png              # system architecture diagram (embedded above)
+│   └── generate_architecture_diagram.py
 ├── configs/default.yaml     # every hyperparameter in one place
 ├── scripts/
 │   └── prepare_data.py      # turn a raw NEU-CLS/NEU-DET download into the expected layout
@@ -141,12 +229,21 @@ per-class folders, or an already-correct Kaggle layout):
 # Option A: Kaggle CLI (requires a free Kaggle account + API token)
 pip install kaggle
 kaggle datasets download -d kaustubhdikshit/neu-surface-defect-database
-unzip neu-surface-defect-database.zip -d raw_neu
+unzip -q neu-surface-defect-database.zip -d raw_neu
 python scripts/prepare_data.py --input raw_neu --output ./NEU-CLS
 
 # Option B: any other NEU-CLS/NEU-DET mirror you've already downloaded
 python scripts/prepare_data.py --input /path/to/raw/download --output ./NEU-CLS
 ```
+
+`prepare_data.py` walks the entire input tree recursively (any nesting
+depth), matches images to classes by filename/folder with spelling
+normalization (`rolled-in-scale`, `rolled_in_scale`, `Rolled In Scale` all
+match `rolled-in_scale`), and ignores non-image sibling folders like
+`annotations/` that ship alongside the Kaggle NEU-DET object-detection
+variant. If it can't find any class-labelled images it prints the actual
+files it found under `--input` so you can see what went wrong, instead of
+failing silently.
 
 ## Train
 
