@@ -187,17 +187,23 @@ steel-defect-detector/
 │   └── generate_architecture_diagram.py
 ├── configs/default.yaml     # every hyperparameter in one place
 ├── scripts/
-│   └── prepare_data.py      # turn a raw NEU-CLS/NEU-DET download into the expected layout
+│   ├── prepare_data.py      # turn a raw NEU-CLS/NEU-DET download into the expected layout
+│   ├── find_duplicate_groups.py  # detect near-duplicate images -> leakage-safe split groups
+│   ├── calibrate.py         # fit per-fold temperature scaling
+│   └── stress_test.py       # robustness-to-corruption + out-of-distribution probing
 ├── src/
 │   ├── dataset.py           # NEUCLSDataset + SteelSurfaceAugment (provided, documented above)
 │   ├── model.py             # SteelDefectNet: timm backbone + head, discriminative LR groups
 │   ├── engine.py            # train_one_epoch / evaluate, AMP, warmup+cosine schedule
 │   ├── utils.py             # seeding, checkpoints, metrics, plots
 │   ├── gradcam.py           # Grad-CAM explainability
+│   ├── calibration.py       # temperature scaling, ECE, reliability diagrams
+│   ├── ensemble.py          # multi-checkpoint ensemble + uncertainty + decision gate
 │   ├── export_onnx.py       # ONNX export + PyTorch/ONNXRuntime parity check
-│   └── infer.py             # CLI single-image inference
-├── train.py                 # stratified k-fold CV training driver
-├── app.py                   # Gradio demo (upload → prediction + Grad-CAM)
+│   ├── infer.py             # CLI single-image inference (single model, demo use)
+│   └── production_infer.py  # CLI single-image inference (ensemble + calibration + decision)
+├── train.py                 # stratified group k-fold CV training driver
+├── app.py                   # Gradio demo (ensemble prediction + Grad-CAM + decision banner)
 └── requirements.txt
 ```
 
@@ -308,6 +314,90 @@ Outputs per fold, under `outputs/fold{N}/`:
 
 Plus `outputs/cv_summary.json` — mean +/- std accuracy/macro-F1 across folds.
 
+## Calibrate the ensemble
+
+Raw softmax confidence is not trustworthy on its own — deep networks are
+routinely overconfident, so "92% confident" does not reliably mean "correct
+92% of the time." Before deploying, fit a temperature-scaling correction
+per fold using each fold's own held-out validation split:
+
+```bash
+python scripts/calibrate.py --config configs/default.yaml --groups-file groups.json \
+  --out-dir outputs --out-file outputs/calibration.json
+```
+
+This writes `outputs/calibration.json` (one temperature per fold) and, per
+fold, `reliability_before.png` / `reliability_after.png` — a plot of
+confidence vs. actual accuracy per confidence bin, and the expected
+calibration error (ECE) before and after scaling. Run this once after
+training; every inference path below uses it automatically if present.
+
+## Production inference (ensemble + calibration + decision gate)
+
+`src/production_infer.py` is the real deployment entry point — as opposed
+to `src/infer.py`, which is a single-model demo helper. It runs the full
+cross-validation ensemble (all fold checkpoints, not just one), applies
+each model's fitted temperature, and returns a structured decision, not
+just a class label:
+
+```bash
+python -m src.production_infer --image path/to/steel.jpg \
+  --checkpoints outputs/fold0/best_model.pt outputs/fold1/best_model.pt outputs/fold2/best_model.pt \
+  --calibration outputs/calibration.json
+```
+
+```json
+{
+  "prediction": "Scratches",
+  "calibrated_confidence": 0.94,
+  "vote_agreement": 1.0,
+  "member_votes": ["Scratches", "Scratches", "Scratches"],
+  "decision": "auto",
+  "n_models": 3,
+  "latency_ms": 42.1
+}
+```
+
+`decision` is `"auto"` only when calibrated confidence AND cross-model
+agreement both clear their thresholds (`--conf-threshold`,
+`--agree-threshold`, defaults 0.90 / 0.99) — otherwise `"review"`, meaning
+the image should go to a human rather than be acted on automatically. This
+is the concrete implementation of the confidence-gated split in the
+architecture diagram above: the system doesn't have to be right every
+time, it only has to know when it isn't sure. The JSON output is written
+to map directly onto a REST API response with no reshaping.
+
+## Stress test: robustness and out-of-distribution behaviour
+
+Cross-validated accuracy on NEU-CLS tells you how well the model fits this
+particular, curated benchmark — not how it behaves on a real camera feed
+under different lighting, or on an image that isn't a steel defect at all.
+Run this before trusting a benchmark number for anything production-facing:
+
+```bash
+python scripts/stress_test.py --config configs/default.yaml --out-dir outputs \
+  --calibration outputs/calibration.json --groups-file groups.json
+```
+
+Two experiments, both against the real trained ensemble:
+
+1. **Robustness under corruption** — applies increasing severities of
+   blur, brightness/contrast shift, additive noise, and
+   downscale/upscale to real validation images and measures accuracy at
+   each severity, saved to `outputs/robustness_curves.png`. A model that
+   collapses under mild blur or a brightness shift, however high its
+   clean-image accuracy, is not ready for a plant floor.
+2. **Out-of-distribution probing** — feeds the ensemble synthetic images
+   that are deliberately *not* steel surfaces (random noise, a smooth
+   gradient, a checkerboard, flat colour, a simple line-drawn shape) and
+   checks whether calibrated confidence and cross-model agreement actually
+   drop, i.e. whether the decision gate above would catch these rather
+   than confidently guessing a class — the classifier has exactly six
+   buckets and no "none of the above" option, so this is the only way to
+   see whether the uncertainty signal is doing its job.
+
+Full results are saved to `outputs/stress_test_results.json`.
+
 ## Evaluate a single image
 
 ```bash
@@ -324,11 +414,17 @@ python -m src.export_onnx --checkpoint outputs/fold0/best_model.pt --out steel_d
 ## Interactive demo
 
 ```bash
+# Ensemble mode (recommended) — uses all fold checkpoints + calibration
+python app.py --out-dir outputs
+
+# Single-model mode, for a quick smoke test
 python app.py --checkpoint outputs/fold0/best_model.pt
 ```
 
-Upload an image and get back the predicted class, full probability
-distribution, and a Grad-CAM overlay explaining the prediction.
+Upload an image and get back the calibrated probability distribution, a
+Grad-CAM overlay explaining the prediction, and an explicit
+auto-decide-vs-route-to-human banner driven by the same confidence/agreement
+gate as `src/production_infer.py`.
 
 ---
 
