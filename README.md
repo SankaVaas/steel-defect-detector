@@ -245,18 +245,60 @@ variant. If it can't find any class-labelled images it prints the actual
 files it found under `--input` so you can see what went wrong, instead of
 failing silently.
 
+### Near-duplicate images and why a plain k-fold split leaks
+
+NEU-CLS is well known to contain many near-duplicate images within each
+class — crops of the same physical defect sample photographed more than
+once, or overlapping crops of the same source scan. Roughly a third of the
+dataset falls into a near-duplicate cluster with at least one other image
+(measured with perceptual hashing — see below), and some clusters contain
+80+ images. A random or `StratifiedKFold` split treats every image as
+independent evidence and will routinely place near-duplicates of the same
+physical sample on both sides of a train/validation split. The "held out"
+validation image is then not really unseen: the model has already learned
+that near-identical texture from its twin in the training set.
+
+This is the actual explanation if you see validation accuracy/macro-F1
+saturate at a suspiciously perfect 1.0000 with ~0 variance across every
+fold — it is very unlikely to be the model generalizing perfectly, and far
+more likely to be this leakage. Run this **before** training:
+
+```bash
+python scripts/find_duplicate_groups.py --data-root ./NEU-CLS --out groups.json
+```
+
+This hashes every image (8x8 average hash), unions near-duplicates within
+the same class (Hamming distance <= 4/64 by default) via union-find, and
+writes a `groups.json` mapping each filename to a cluster id. Pass it to
+`train.py`:
+
+```bash
+python train.py --config configs/default.yaml --groups-file groups.json
+```
+
+With `--groups-file`, `train.py` switches from `StratifiedKFold` to
+`StratifiedGroupKFold`, which keeps class balance across folds *and*
+guarantees every near-duplicate cluster stays entirely on one side of every
+split — zero near-duplicate leakage into validation, by construction, verified
+directly rather than assumed. Without `--groups-file`, `train.py` still runs
+but prints a loud warning, since the resulting validation metrics will be
+optimistic.
+
 ## Train
 
 ```bash
+# Leakage-safe split (recommended) — generate groups.json first, see above
+python train.py --config configs/default.yaml --groups-file groups.json
+
 # Full run as specified in configs/default.yaml (EfficientNet-B4, 30 epochs, 5-fold CV)
-python train.py --config configs/default.yaml
+python train.py --config configs/default.yaml --groups-file groups.json
 
 # Quick smoke test on modest hardware
-python train.py --config configs/default.yaml \
+python train.py --config configs/default.yaml --groups-file groups.json \
   --backbone resnet18 --epochs 5 --folds 2 --batch-size 16
 
 # No internet access to download pretrained ImageNet weights? Train from scratch:
-python train.py --config configs/default.yaml --no-pretrained
+python train.py --config configs/default.yaml --groups-file groups.json --no-pretrained
 ```
 
 Outputs per fold, under `outputs/fold{N}/`:

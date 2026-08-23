@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
 from src.dataset import NEUCLSDataset, load_all_paths, make_transform
 from src.engine import build_optimizer, build_scheduler, evaluate, train_one_epoch
@@ -58,6 +58,11 @@ def parse_args():
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--out-dir", default="outputs")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--groups-file", type=str, default=None,
+                     help="path to groups.json from scripts/find_duplicate_groups.py — required for a "
+                          "leakage-safe split on NEU-CLS, which contains many near-duplicate images. "
+                          "Without this, StratifiedKFold is used and validation metrics WILL be "
+                          "inflated by train/val leakage across near-duplicate crops.")
     return ap.parse_args()
 
 
@@ -176,8 +181,28 @@ def main():
     print(f"Loaded {len(paths)} images across {cfg['num_classes']} classes: "
           f"{dict(zip(*np.unique(labels, return_counts=True)))}")
 
-    skf = StratifiedKFold(n_splits=cfg["n_folds"], shuffle=True, random_state=args.seed)
-    splits = list(skf.split(paths, labels))
+    if args.groups_file:
+        with open(args.groups_file) as f:
+            name_to_group = json.load(f)
+        try:
+            groups = np.array([name_to_group[Path(p).name] for p in paths])
+        except KeyError as e:
+            raise SystemExit(
+                f"Image {e} from {cfg['data_root']} has no entry in {args.groups_file}. "
+                "Regenerate it with scripts/find_duplicate_groups.py against the same --data-root."
+            )
+        n_groups = len(set(groups.tolist()))
+        print(f"Using StratifiedGroupKFold with {n_groups} near-duplicate groups from {args.groups_file} "
+              f"(leakage-safe split — near-duplicate images always land on the same side of every fold).")
+        skf = StratifiedGroupKFold(n_splits=cfg["n_folds"], shuffle=True, random_state=args.seed)
+        splits = list(skf.split(paths, labels, groups=groups))
+    else:
+        print("WARNING: no --groups-file given. NEU-CLS contains many near-duplicate images within each "
+              "class; a plain StratifiedKFold split WILL leak near-duplicates across train/val and "
+              "inflate validation accuracy/F1 (this is why you may see suspiciously perfect scores). "
+              "Run scripts/find_duplicate_groups.py and pass --groups-file for a trustworthy result.")
+        skf = StratifiedKFold(n_splits=cfg["n_folds"], shuffle=True, random_state=args.seed)
+        splits = list(skf.split(paths, labels))
 
     fold_range = [args.fold_to_train] if args.fold_to_train is not None else range(cfg["n_folds"])
 
